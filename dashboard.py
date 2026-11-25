@@ -23,6 +23,11 @@ st.set_page_config(page_title="실적 스크리닝", page_icon="📊", layout="w
 def load():
     df = pd.read_csv(DATA, dtype={"종목코드": str, "결산월": str}, encoding="utf-8-sig")
     df["종목코드"] = df["종목코드"].str.zfill(6)
+    for c in ("원본매출액(억)", "원본영업이익(억)"):
+        if c not in df:
+            df[c] = np.nan
+    # 값이 하나도 없는 빈 줄은 제거 (아직 발표 전 기간 등)
+    df = df.dropna(subset=[SALES, OP, "원본매출액(억)", "원본영업이익(억)"], how="all").copy()
     # 이상치 정리 (DART 공시 단위 오류)
     # - 500조원 초과, 또는 '회사 평소 규모의 1,000배 이상이면서 1조원 이상'인 값은 빈칸
     #   (매출이 이상하면 같은 기간 영업이익도 같은 오류라서 함께 빈칸)
@@ -37,11 +42,29 @@ def load():
     df.loc[bad_sales, [SALES, OP]] = np.nan
     df.loc[bad_op, OP] = np.nan
     df.loc[df[SALES] < 0, SALES] = np.nan
+    for c in ("원본매출액(억)", "원본영업이익(억)", "환율"):
+        if c not in df:
+            df[c] = np.nan
+    if "매출기준" not in df:
+        df["매출기준"] = np.where(df[SALES].notna(), "매출액", None)
     if "통화" not in df:
         df["통화"] = "KRW"
     df["통화"] = df["통화"].fillna("KRW")
     return df
 
+
+
+def currency_label(df):
+    """회사별 공시 통화 표시: 외화가 한 번이라도 있으면 'USD 환산' 등"""
+    fx = df[df["통화"] != "KRW"].groupby("종목코드")["통화"].agg(lambda s: ",".join(sorted(set(s))) + " 환산")
+    return pd.Series(df["종목코드"].unique()).to_frame("종목코드").assign(
+        공시통화=lambda x: x["종목코드"].map(fx).fillna("KRW")).set_index("종목코드")["공시통화"]
+
+
+def basis_label(df):
+    """회사별 매출 기준 (가장 최근 값): 매출액 / 영업수익 / 이자·수수료·보험수익 합"""
+    b = df.dropna(subset=["매출기준"]).sort_values(["연도", "분기"]).groupby("종목코드")["매출기준"].last()
+    return b.reindex(df["종목코드"].unique()).fillna("-")
 
 
 @st.cache_data(show_spinner="엑셀 파일 만드는 중...")
@@ -56,7 +79,9 @@ def build_excel(df):
         last = cnt[cnt >= cnt.max() * 0.5].index.max()
         return sorted(k for k in d[key].unique() if k <= last)[-n:]
 
-    info = df.drop_duplicates("종목코드", keep="last").set_index("종목코드")[["회사명", "시장", "결산월", "통화"]]
+    info = df.drop_duplicates("종목코드", keep="last").set_index("종목코드")[["회사명", "시장", "결산월"]]
+    info["공시통화"] = currency_label(df)
+    info["매출기준"] = basis_label(df)
     a = df[df["분기"] == 0]
     years = latest(a, "연도", 5)
     q = df[df["분기"] > 0].assign(순서=lambda x: x["연도"] * 10 + x["분기"])
@@ -75,7 +100,7 @@ def build_excel(df):
         ("분기 영업이익", wide(q, "순서", qkeys, OP, labels)),
     ]
     base = info.reset_index().sort_values(["시장", "회사명"]).reset_index(drop=True)
-    data = pd.concat([base[["종목코드", "회사명", "시장", "결산월", "통화"]]]
+    data = pd.concat([base[["종목코드", "회사명", "시장", "결산월", "공시통화", "매출기준"]]]
                      + [b.reindex(base["종목코드"]).reset_index(drop=True) for _, b in blocks], axis=1)
 
     buf = io.BytesIO()
@@ -97,33 +122,59 @@ def build_excel(df):
                 x.font = Font(bold=True)
                 x.alignment = Alignment(horizontal="center")
 
-    group(1, 5, "종목 정보 (단위: 억, 통화 기준)")
-    col = 6
+    group(1, 6, "종목 정보 (단위: 억원)")
+    col = 7
     for title, b in blocks:
         group(col, col + b.shape[1] - 1, title)
         col += b.shape[1]
     n = len(data) + 2
-    for c in range(6, col):
+    for c in range(7, col):
         ws.column_dimensions[get_column_letter(c)].width = 11
         for r in range(3, n + 1):
             ws.cell(row=r, column=c).number_format = "#,##0.0;[Red]-#,##0.0"
-    for letter, w in zip("ABCDE", (9, 22, 8, 7, 6)):
+    for letter, w in zip("ABCDEF", (9, 22, 8, 7, 10, 20)):
         ws.column_dimensions[letter].width = w
-    ws.freeze_panes = "F3"
+    ws.freeze_panes = "G3"
     ws.auto_filter.ref = f"A2:{get_column_letter(col - 1)}{n}"
 
     note = wb.create_sheet("설명")
     for i, line in enumerate([
-        "출처: 금융감독원 DART (OpenDART 다중회사 주요계정)",
-        "단위: 억 (통화 열 기준, 대부분 KRW=억원) / 음수(적자)는 빨간색",
-        "통화가 USD 등인 회사는 해당 통화 기준 금액 (예: 두산밥캣은 2023년부터 달러 공시)",
+        "출처: 금융감독원 DART (OpenDART 다중회사 주요계정 + 빈칸은 단일회사 전체 재무제표로 보완)",
+        "단위: 억원 / 음수(적자)는 빨간색",
+        "공시통화가 'USD 환산' 등인 회사: 외화 공시 금액을 기간 평균 환율(유럽중앙은행 기준)로 원화 환산한 값",
+        "  → 원본 외화 금액과 적용 환율은 '외화공시_원본' 시트에 있음",
         "연결재무제표 우선, 연결이 없는 회사는 별도재무제표",
+        "매출기준: 일반 기업은 '매출액'. 금융사는 매출 계정이 없어 '영업수익'(증권사 등) 또는",
+        "  '이자·수수료·보험수익 합'(은행·금융지주·보험사)을 매출액 칸에 넣음 → 일반 기업과 직접 비교는 주의",
         "4분기 = 연간(사업보고서) − 3분기 누적",
-        "빈칸 = 공시 데이터 없음, 금융업 등 매출 계정이 다른 회사, 공시 단위 오류로 걸러낸 값",
+        "빈칸 = 공시 데이터 없음(상장 전 등), 매출 계정을 찾지 못한 경우, 공시 단위 오류로 걸러낸 값",
         "결산월이 12월이 아닌 회사는 연도 기준이 다를 수 있음",
     ], 1):
         note.cell(row=i, column=1, value=line)
-    note.column_dimensions["A"].width = 80
+    note.column_dimensions["A"].width = 90
+
+    fxrows = df[df["통화"] != "KRW"].copy()
+    if len(fxrows):
+        fxrows["기간"] = np.where(fxrows["분기"] == 0, "연간", fxrows["분기"].astype(str) + "Q")
+        fxrows = fxrows.sort_values(["회사명", "연도", "분기"])[
+            ["종목코드", "회사명", "연도", "기간", "통화", "원본매출액(억)", "원본영업이익(억)", "환율", SALES, OP]]
+        fxrows.columns = ["종목코드", "회사명", "연도", "기간", "통화", "원본 매출액(억, 외화)", "원본 영업이익(억, 외화)",
+                          "적용 환율(기간평균)", "환산 매출액(억원)", "환산 영업이익(억원)"]
+        ws2 = wb.create_sheet("외화공시_원본", 1)
+        ws2.append(list(fxrows.columns))
+        for row in fxrows.itertuples(index=False):
+            ws2.append([None if (isinstance(v, float) and np.isnan(v)) else v for v in row])
+        for c in range(1, len(fxrows.columns) + 1):
+            ws2.cell(row=1, column=c).font = Font(bold=True)
+            ws2.cell(row=1, column=c).fill = PatternFill("solid", fgColor="E2EFDA")
+            ws2.column_dimensions[get_column_letter(c)].width = 22 if c == 2 else 14
+        for r in range(2, len(fxrows) + 2):
+            for c in (6, 7):
+                ws2.cell(row=r, column=c).number_format = "#,##0.00;[Red]-#,##0.00"
+            ws2.cell(row=r, column=8).number_format = "#,##0.00"
+            for c in (9, 10):
+                ws2.cell(row=r, column=c).number_format = "#,##0.0;[Red]-#,##0.0"
+        ws2.freeze_panes = "C2"
 
     out = io.BytesIO()
     wb.save(out)
@@ -207,6 +258,8 @@ idx = sales_w.index.union(op_w.index)
 sales_w, op_w = sales_w.reindex(idx), op_w.reindex(idx)
 t = pd.DataFrame(index=idx)
 t = t.join(names)
+t["공시통화"] = currency_label(df).reindex(t.index).fillna("KRW")
+t["매출기준"] = basis_label(df).reindex(t.index).fillna("-")
 t["매출액"] = sales_w[cur]
 t["영업이익"] = op_w[cur]
 with np.errstate(divide="ignore", invalid="ignore"):
@@ -255,7 +308,7 @@ c2.metric("영업이익 흑자", f"{(f['영업이익'] > 0).sum():,}개")
 c3.metric("흑자전환", f"{f['흑자전환'].sum():,}개")
 c4.metric("영업이익률 중앙값", f"{f['영업이익률(%)'].median():.1f}%" if len(f) else "-")
 
-show = f.reset_index()[["종목코드", "회사명", "시장", "매출액", "영업이익", "영업이익률(%)",
+show = f.reset_index()[["종목코드", "회사명", "시장", "공시통화", "매출기준", "매출액", "영업이익", "영업이익률(%)",
                          "매출 성장률(%)", "영업이익 증가율(%)", "매출 추이", "영업이익 추이"]]
 st.caption("행을 클릭하면 아래에 해당 기업의 상세 실적이 나옵니다.")
 event = st.dataframe(
@@ -316,5 +369,17 @@ fig.update_layout(
 st.plotly_chart(fig, width="stretch")
 
 basis = one["기준"].dropna().unique()
+sb = one["매출기준"].dropna().unique()
+if len(sb) and any(x != "매출액" for x in sb):
+    st.caption(f"⚠️ 금융사라 매출액 칸에 **{', '.join(sb)}**을(를) 넣었습니다. 일반 기업 매출액과 직접 비교할 때는 주의하세요.")
 st.caption(f"재무제표 기준: {', '.join(basis) if len(basis) else '-'} · 결산월: {df[df['종목코드'] == code]['결산월'].iloc[0]}월")
 st.dataframe(one.set_index("기간")[[SALES, OP, "영업이익률(%)"]].T, width="stretch")
+
+fx_one = one[one["통화"] != "KRW"]
+if len(fx_one):
+    cur_names = ", ".join(sorted(fx_one["통화"].unique()))
+    st.info(f"이 회사는 일부 기간을 **{cur_names}**로 공시했습니다. 위 숫자는 기간 평균 환율로 원화 환산한 값이고, "
+            "아래는 공시 원본 금액입니다.")
+    st.dataframe(fx_one.set_index("기간")[["통화", "원본매출액(억)", "원본영업이익(억)", "환율"]]
+                 .rename(columns={"원본매출액(억)": "원본 매출액(억, 외화)", "원본영업이익(억)": "원본 영업이익(억, 외화)",
+                                  "환율": "적용 환율"}), width="stretch")
