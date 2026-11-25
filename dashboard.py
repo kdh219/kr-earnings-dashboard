@@ -105,7 +105,9 @@ sales_w = d.pivot_table(index="종목코드", columns="기간", values=SALES, ag
 op_w = d.pivot_table(index="종목코드", columns="기간", values=OP, aggfunc="first").reindex(columns=periods)
 cur = periods[-1]
 
-t = pd.DataFrame(index=sales_w.index)
+idx = sales_w.index.union(op_w.index)
+sales_w, op_w = sales_w.reindex(idx), op_w.reindex(idx)
+t = pd.DataFrame(index=idx)
 t = t.join(names)
 t["매출액"] = sales_w[cur]
 t["영업이익"] = op_w[cur]
@@ -118,7 +120,7 @@ if mode == "연간":
 else:
     t["매출 성장률(%)"] = growth(sales_w[cur], sales_w[prev])
 t["영업이익 증가율(%)"] = growth(op_w[cur], op_w[prev])
-t["흑자전환"] = (op_w[cur] > 0) & (op_w[prev] <= 0)
+t["흑자전환"] = ((op_w[cur] > 0) & (op_w[prev] <= 0)).fillna(False).astype(bool)
 t["연속증가"] = streak(op_w)
 t["매출 추이"] = trend(sales_w)
 t["영업이익 추이"] = trend(op_w)
@@ -136,7 +138,7 @@ if min_growth > -50:
 if only_profit:
     f = f[f["영업이익"] > 0]
 if only_turn:
-    f = f[f["흑자전환"]]
+    f = f[f["흑자전환"].fillna(False).astype(bool)]
 if min_streak:
     f = f[f["연속증가"] >= min_streak]
 f = f.sort_values("매출액", ascending=False)
