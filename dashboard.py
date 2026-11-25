@@ -22,12 +22,14 @@ st.set_page_config(page_title="실적 스크리닝", page_icon="📊", layout="w
 def load():
     df = pd.read_csv(DATA, dtype={"종목코드": str, "결산월": str}, encoding="utf-8-sig")
     df["종목코드"] = df["종목코드"].str.zfill(6)
-    # 이상치 정리: 음수 매출, 회사 평소 규모의 50배를 넘는 값(공시 단위 오류)은 빈칸 처리
+    # 이상치 정리 (DART 공시 단위 오류)
+    # - 음수 매출은 빈칸
+    # - 500조원 초과, 또는 '회사 평소 매출의 1,000배 이상이면서 1조원 이상'인 값은 빈칸
     df.loc[df[SALES] < 0, SALES] = np.nan
-    scale = df.groupby("종목코드")[SALES].transform(lambda s: s.abs().median())
-    scale = scale.fillna(df.groupby("종목코드")[OP].transform(lambda s: s.abs().median()))
+    usual = df.groupby("종목코드")[SALES].transform(lambda s: s.abs().median()).fillna(0)
     for c in (SALES, OP):
-        df.loc[df[c].abs() > scale * 50, c] = np.nan
+        v = df[c].abs()
+        df.loc[(v > 5e6) | ((v > usual * 1000) & (v > 1e4)), c] = np.nan
     return df
 
 
