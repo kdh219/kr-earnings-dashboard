@@ -3,6 +3,7 @@
 국내 상장사 실적 스크리닝 대시보드
 실행:  streamlit run dashboard.py   (또는 3_dashboard.bat 더블클릭)
 """
+import io
 import os
 
 import numpy as np
@@ -23,15 +24,110 @@ def load():
     df = pd.read_csv(DATA, dtype={"종목코드": str, "결산월": str}, encoding="utf-8-sig")
     df["종목코드"] = df["종목코드"].str.zfill(6)
     # 이상치 정리 (DART 공시 단위 오류)
+    # - 500조원 초과, 또는 '회사 평소 규모의 1,000배 이상이면서 1조원 이상'인 값은 빈칸
+    #   (매출이 이상하면 같은 기간 영업이익도 같은 오류라서 함께 빈칸)
     # - 음수 매출은 빈칸
-    # - 500조원 초과, 또는 '회사 평소 매출의 1,000배 이상이면서 1조원 이상'인 값은 빈칸
-    df.loc[df[SALES] < 0, SALES] = np.nan
-    usual = df.groupby("종목코드")[SALES].transform(lambda s: s.abs().median()).fillna(0)
-    for c in (SALES, OP):
+    g = df.groupby("종목코드")
+    usual = (g[SALES].transform(lambda s: s.abs().median())
+             .fillna(g[OP].transform(lambda s: s.abs().median())).fillna(0))
+    def broken(c):
         v = df[c].abs()
-        df.loc[(v > 5e6) | ((v > usual * 1000) & (v > 1e4)), c] = np.nan
+        return (v > 5e6) | ((v > usual * 1000) & (v > 1e4))
+    bad_sales, bad_op = broken(SALES), broken(OP)
+    df.loc[bad_sales, [SALES, OP]] = np.nan
+    df.loc[bad_op, OP] = np.nan
+    df.loc[df[SALES] < 0, SALES] = np.nan
+    if "통화" not in df:
+        df["통화"] = "KRW"
+    df["통화"] = df["통화"].fillna("KRW")
     return df
 
+
+
+@st.cache_data(show_spinner="엑셀 파일 만드는 중...")
+def build_excel(df):
+    """전 종목 한 시트: 종목정보 | 연간 매출액 5년 | 연간 영업이익 5년 | 분기 매출액 20분기 | 분기 영업이익 20분기"""
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    def latest(d, key, n):
+        cnt = d.groupby(key)["종목코드"].nunique()
+        last = cnt[cnt >= cnt.max() * 0.5].index.max()
+        return sorted(k for k in d[key].unique() if k <= last)[-n:]
+
+    info = df.drop_duplicates("종목코드", keep="last").set_index("종목코드")[["회사명", "시장", "결산월", "통화"]]
+    a = df[df["분기"] == 0]
+    years = latest(a, "연도", 5)
+    q = df[df["분기"] > 0].assign(순서=lambda x: x["연도"] * 10 + x["분기"])
+    qkeys = latest(q, "순서", 20)
+    labels = [f"{k // 10}.{k % 10}Q" for k in qkeys]
+
+    def wide(d, key, keys, col, names):
+        w = d.pivot_table(index="종목코드", columns=key, values=col, aggfunc="first").reindex(columns=keys)
+        w.columns = names
+        return w
+
+    blocks = [
+        ("연간 매출액", wide(a, "연도", years, SALES, [str(y) for y in years])),
+        ("연간 영업이익", wide(a, "연도", years, OP, [str(y) for y in years])),
+        ("분기 매출액", wide(q, "순서", qkeys, SALES, labels)),
+        ("분기 영업이익", wide(q, "순서", qkeys, OP, labels)),
+    ]
+    base = info.reset_index().sort_values(["시장", "회사명"]).reset_index(drop=True)
+    data = pd.concat([base[["종목코드", "회사명", "시장", "결산월", "통화"]]]
+                     + [b.reindex(base["종목코드"]).reset_index(drop=True) for _, b in blocks], axis=1)
+
+    buf = io.BytesIO()
+    data.to_excel(buf, sheet_name="전종목", index=False, startrow=1)
+    buf.seek(0)
+    wb = load_workbook(buf)
+    ws = wb["전종목"]
+    thin = Side(style="thin", color="BFBFBF")
+    colors = {"연간 매출액": "DDEBF7", "연간 영업이익": "FCE4D6", "분기 매출액": "DDEBF7", "분기 영업이익": "FCE4D6"}
+
+    def group(c1, c2, title):
+        ws.merge_cells(start_row=1, start_column=c1, end_row=1, end_column=c2)
+        ws.cell(row=1, column=c1, value=title)
+        for c in range(c1, c2 + 1):
+            for r in (1, 2):
+                x = ws.cell(row=r, column=c)
+                x.fill = PatternFill("solid", fgColor=colors.get(title, "D9D9D9"))
+                x.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+                x.font = Font(bold=True)
+                x.alignment = Alignment(horizontal="center")
+
+    group(1, 5, "종목 정보 (단위: 억, 통화 기준)")
+    col = 6
+    for title, b in blocks:
+        group(col, col + b.shape[1] - 1, title)
+        col += b.shape[1]
+    n = len(data) + 2
+    for c in range(6, col):
+        ws.column_dimensions[get_column_letter(c)].width = 11
+        for r in range(3, n + 1):
+            ws.cell(row=r, column=c).number_format = "#,##0.0;[Red]-#,##0.0"
+    for letter, w in zip("ABCDE", (9, 22, 8, 7, 6)):
+        ws.column_dimensions[letter].width = w
+    ws.freeze_panes = "F3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(col - 1)}{n}"
+
+    note = wb.create_sheet("설명")
+    for i, line in enumerate([
+        "출처: 금융감독원 DART (OpenDART 다중회사 주요계정)",
+        "단위: 억 (통화 열 기준, 대부분 KRW=억원) / 음수(적자)는 빨간색",
+        "통화가 USD 등인 회사는 해당 통화 기준 금액 (예: 두산밥캣은 2023년부터 달러 공시)",
+        "연결재무제표 우선, 연결이 없는 회사는 별도재무제표",
+        "4분기 = 연간(사업보고서) − 3분기 누적",
+        "빈칸 = 공시 데이터 없음, 금융업 등 매출 계정이 다른 회사, 공시 단위 오류로 걸러낸 값",
+        "결산월이 12월이 아닌 회사는 연도 기준이 다를 수 있음",
+    ], 1):
+        note.cell(row=i, column=1, value=line)
+    note.column_dimensions["A"].width = 80
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), f"실적_전종목_{labels[-1].replace('.', '')}.xlsx"
 
 if not os.path.exists(DATA):
     st.error("financials.csv 가 없습니다. 먼저 2_collect.bat 을 실행해 데이터를 받아 주세요.")
@@ -149,6 +245,9 @@ f = f.sort_values("매출액", ascending=False)
 st.title("📊 국내 상장사 실적 스크리닝")
 growth_note = f"{base}→{cur} 연평균" if mode == "연간" else f"{prev} 대비"
 st.caption(f"기준 기간: **{cur}** · 매출 성장률은 {growth_note} · 영업이익 증가율은 {prev} 대비 · 단위: 억원 · 출처: DART")
+xlsx_bytes, xlsx_name = build_excel(df)
+st.download_button("📥 전종목 엑셀 다운로드 (연간 5년 + 분기 20분기)", xlsx_bytes, file_name=xlsx_name,
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("조건에 맞는 기업", f"{len(f):,}개")
