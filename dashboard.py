@@ -5,10 +5,15 @@
 """
 import io
 import os
+import threading
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +22,132 @@ SALES, OP = "매출액(억원)", "영업이익(억원)"
 C_SALES, C_OP, C_NEG = "#4C78A8", "#F58518", "#D64545"
 
 st.set_page_config(page_title="실적 스크리닝", page_icon="📊", layout="wide")
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+# ================================================================ 시가총액 (한국투자증권 Open API)
+class MarketCapFeed:
+    """백그라운드에서 전 종목 현재가를 돌아가며 조회해 시가총액(억원)을 모아 둠.
+    - 방문자가 여러 명이어도 조회 작업은 하나만 돌아감 (st.cache_resource)
+    - 초당 15건 (실전 계좌 한도 초당 20건보다 여유 있게)
+    - 장중(평일 08:50~15:40)에는 쉬지 않고 반복, 장 밖에는 한 바퀴 돈 뒤 30분 쉬기"""
+
+    BASE = "https://openapi.koreainvestment.com:9443"
+    PER_SEC = 15
+
+    def __init__(self, app_key, app_secret, codes, mock=False):
+        self.app_key, self.app_secret, self.codes, self.mock = app_key, app_secret, list(codes), mock
+        if mock:
+            self.PER_SEC = 5000
+        self.data = {}            # 종목코드 -> (시가총액 억원, 현재가, 조회시각)
+        self.lock = threading.Lock()
+        self.token, self.token_exp, self.last_token_try = None, datetime.min.replace(tzinfo=KST), 0.0
+        self.status, self.cycle_done_at = "시작 중", None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    # ---- 토큰: 하루 유효, 발급은 1분에 1번만
+    def _get_token(self):
+        now = datetime.now(KST)
+        if self.token and now < self.token_exp - timedelta(minutes=30):
+            return self.token
+        if self.mock:
+            self.token, self.token_exp = "mock", now + timedelta(hours=24)
+            return self.token
+        wait = 61 - (time.time() - self.last_token_try)
+        if wait > 0:
+            time.sleep(wait)
+        self.last_token_try = time.time()
+        r = requests.post(f"{self.BASE}/oauth2/tokenP", timeout=20,
+                          json={"grant_type": "client_credentials", "appkey": self.app_key, "appsecret": self.app_secret})
+        j = r.json()
+        if "access_token" not in j:
+            raise RuntimeError(f"토큰 발급 실패: {j.get('error_description') or j.get('msg1') or j}")
+        self.token = j["access_token"]
+        exp = j.get("access_token_token_expired")
+        try:
+            self.token_exp = datetime.strptime(exp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+        except Exception:
+            self.token_exp = now + timedelta(hours=23)
+        return self.token
+
+    def _fetch(self, code):
+        if self.mock:
+            h = int(code) if code.isdigit() else 1
+            return float(1000 + h % 50000), float(10000 + h % 900)
+        headers = {"content-type": "application/json; charset=utf-8", "authorization": f"Bearer {self._get_token()}",
+                   "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": "FHKST01010100", "custtype": "P"}
+        r = requests.get(f"{self.BASE}/uapi/domestic-stock/v1/quotations/inquire-price", headers=headers, timeout=10,
+                         params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code})
+        j = r.json()
+        if j.get("rt_cd") != "0":
+            msg = j.get("msg_cd", "")
+            if msg == "EGW00201":                       # 초당 거래건수 초과 → 잠깐 쉬고 다시
+                time.sleep(1)
+                return "retry"
+            if msg in ("EGW00123", "EGW00121"):         # 토큰 만료·무효 → 다시 발급
+                self.token = None
+                return "retry"
+            return None
+        o = j.get("output") or {}
+        price = pd.to_numeric(o.get("stck_prpr"), errors="coerce")
+        mcap = pd.to_numeric(o.get("hts_avls"), errors="coerce")          # HTS 시가총액 (억원)
+        if (pd.isna(mcap) or mcap == 0) and o.get("lstn_stcn"):
+            mcap = price * pd.to_numeric(o.get("lstn_stcn"), errors="coerce") / 1e8
+        return (float(mcap) if pd.notna(mcap) and mcap > 0 else None), (float(price) if pd.notna(price) else None)
+
+    @staticmethod
+    def market_open(now):
+        return now.weekday() < 5 and (8, 50) <= (now.hour, now.minute) <= (15, 40)
+
+    def _run(self):
+        while True:
+            try:
+                self.status = "조회 중"
+                for code in self.codes:
+                    t0 = time.time()
+                    for _ in range(3):
+                        res = self._fetch(code)
+                        if res != "retry":
+                            break
+                    if res and res != "retry" and res[0]:
+                        with self.lock:
+                            self.data[code] = (res[0], res[1], datetime.now(KST))
+                    time.sleep(max(0.0, 1 / self.PER_SEC - (time.time() - t0)))
+                self.cycle_done_at = datetime.now(KST)
+                self.status = "정상"
+            except Exception as e:                       # 네트워크·인증 오류: 1분 뒤 재시도
+                self.status = f"오류: {e}"
+                time.sleep(60)
+                continue
+            if not self.market_open(datetime.now(KST)):
+                self.status = "장 마감 (30분마다 확인)"
+                time.sleep(1800)
+
+    def snapshot(self):
+        with self.lock:
+            items = dict(self.data)
+        mcap = pd.Series({c: v[0] for c, v in items.items()}, dtype=float)
+        latest = max((v[2] for v in items.values()), default=None)
+        return mcap, latest
+
+
+@st.cache_data(ttl=600, max_entries=2)
+def frozen_mcap(bucket_label, _feed):
+    """엑셀용 시가총액: 10분 단위로 고정해서 엑셀을 너무 자주 다시 만들지 않게 함"""
+    return _feed.snapshot()[0].round(0)
+
+
+@st.cache_resource
+def get_feed(codes):
+    try:
+        key, secret = st.secrets.get("KIS_APP_KEY"), st.secrets.get("KIS_APP_SECRET")
+    except Exception:
+        key = secret = None
+    mock = os.environ.get("KIS_MOCK") == "1"
+    if not (key and secret) and not mock:
+        return None
+    return MarketCapFeed(key, secret, codes, mock=mock)
 
 
 @st.cache_data
@@ -67,8 +198,8 @@ def basis_label(df):
     return b.reindex(df["종목코드"].unique()).fillna("-")
 
 
-@st.cache_data(show_spinner="엑셀 파일 만드는 중...")
-def build_excel(df):
+@st.cache_data(show_spinner="엑셀 파일 만드는 중...", max_entries=3)
+def build_excel(df, mcap=None, mcap_time=""):
     """전 종목 한 시트: 종목정보 | 연간 매출액 5년 | 연간 영업이익 5년 | 분기 매출액 20분기 | 분기 영업이익 20분기"""
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -82,6 +213,7 @@ def build_excel(df):
     info = df.drop_duplicates("종목코드", keep="last").set_index("종목코드")[["회사명", "시장", "결산월"]]
     info["공시통화"] = currency_label(df)
     info["매출기준"] = basis_label(df)
+    info["시가총액"] = (mcap if mcap is not None else pd.Series(dtype=float)).reindex(info.index).round(0)
     a = df[df["분기"] == 0]
     years = latest(a, "연도", 5)
     q = df[df["분기"] > 0].assign(순서=lambda x: x["연도"] * 10 + x["분기"])
@@ -100,7 +232,7 @@ def build_excel(df):
         ("분기 영업이익", wide(q, "순서", qkeys, OP, labels)),
     ]
     base = info.reset_index().sort_values(["시장", "회사명"]).reset_index(drop=True)
-    data = pd.concat([base[["종목코드", "회사명", "시장", "결산월", "공시통화", "매출기준"]]]
+    data = pd.concat([base[["종목코드", "회사명", "시장", "결산월", "공시통화", "매출기준", "시가총액"]]]
                      + [b.reindex(base["종목코드"]).reset_index(drop=True) for _, b in blocks], axis=1)
 
     buf = io.BytesIO()
@@ -122,25 +254,26 @@ def build_excel(df):
                 x.font = Font(bold=True)
                 x.alignment = Alignment(horizontal="center")
 
-    group(1, 6, "종목 정보 (단위: 억원)")
-    col = 7
+    group(1, 7, f"종목 정보 (단위: 억원{', 시가총액 ' + mcap_time + ' 기준' if mcap_time else ''})")
+    col = 8
     for title, b in blocks:
         group(col, col + b.shape[1] - 1, title)
         col += b.shape[1]
     n = len(data) + 2
-    for c in range(7, col):
+    for c in range(7, col):  # 7 = 시가총액
         ws.column_dimensions[get_column_letter(c)].width = 11
         for r in range(3, n + 1):
             ws.cell(row=r, column=c).number_format = "#,##0.0;[Red]-#,##0.0"
-    for letter, w in zip("ABCDEF", (9, 22, 8, 7, 10, 20)):
+    for letter, w in zip("ABCDEFG", (9, 22, 8, 7, 10, 20, 12)):
         ws.column_dimensions[letter].width = w
-    ws.freeze_panes = "G3"
+    ws.freeze_panes = "H3"
     ws.auto_filter.ref = f"A2:{get_column_letter(col - 1)}{n}"
 
     note = wb.create_sheet("설명")
     for i, line in enumerate([
         "출처: 금융감독원 DART (OpenDART 다중회사 주요계정 + 빈칸은 단일회사 전체 재무제표로 보완)",
         "단위: 억원 / 음수(적자)는 빨간색",
+        "시가총액: 한국투자증권 Open API 현재가 조회 기준 (보통주, 다운로드 시점의 최근 값)",
         "공시통화가 'USD 환산' 등인 회사: 외화 공시 금액을 기간 평균 환율(유럽중앙은행 기준)로 원화 환산한 값",
         "  → 원본 외화 금액과 적용 환율은 '외화공시_원본' 시트에 있음",
         "연결재무제표 우선, 연결이 없는 회사는 별도재무제표",
@@ -186,6 +319,9 @@ if not os.path.exists(DATA):
 
 df = load()
 names = df.drop_duplicates("종목코드").set_index("종목코드")[["회사명", "시장"]]
+feed = get_feed(tuple(sorted(df["종목코드"].unique())))
+mcap, mcap_at = feed.snapshot() if feed else (pd.Series(dtype=float), None)
+has_mcap = len(mcap) > 0
 
 
 def growth(new, old):
@@ -222,6 +358,12 @@ query = st.sidebar.text_input("회사명 검색", placeholder="예: 삼성")
 
 st.sidebar.header("스크리닝 조건")
 min_sales = st.sidebar.number_input("최소 매출액 (억원)", min_value=0, value=0, step=100)
+if has_mcap:
+    c_a, c_b = st.sidebar.columns(2)
+    mcap_min = c_a.number_input("시가총액 최소 (억원)", min_value=0, value=0, step=1000)
+    mcap_max = c_b.number_input("시가총액 최대 (억원, 0=제한 없음)", min_value=0, value=0, step=1000)
+else:
+    mcap_min = mcap_max = 0
 min_opm = st.sidebar.slider("영업이익률 최소 (%)", -50, 50, -50)
 grow_label = "매출 연평균 성장률 최소 (%, 4년)" if mode == "연간" else "매출 전년동기 대비 증가율 최소 (%)"
 min_growth = st.sidebar.slider(grow_label, -50, 100, -50)
@@ -267,6 +409,7 @@ sales_w, op_w = sales_w.reindex(idx), op_w.reindex(idx)
 t = pd.DataFrame(index=idx)
 t = t.join(names)
 t["공시통화"] = currency_label(df).reindex(t.index).fillna("KRW")
+t["시가총액"] = mcap.reindex(t.index)
 t["매출기준"] = basis_label(df).reindex(t.index).fillna("-")
 t["매출액"] = sales_w[cur]
 t["영업이익"] = op_w[cur]
@@ -310,13 +453,31 @@ if only_turn:
     f = f[f["흑자전환"].fillna(False).astype(bool)]
 if min_streak:
     f = f[f["연속증가"] >= min_streak]
-f = f.sort_values("매출액", ascending=False)
+if mcap_min:
+    f = f[f["시가총액"] >= mcap_min]
+if mcap_max:
+    f = f[f["시가총액"] <= mcap_max]
+f = f.sort_values("시가총액" if has_mcap else "매출액", ascending=False)
 
 # ---------------------------------------------------------------- 화면
 st.title("📊 국내 상장사 실적 스크리닝")
 growth_note = f"{base}→{cur} 연평균" if mode == "연간" else f"{prev} 대비"
 st.caption(f"기준 기간: **{cur}** · 매출 성장률은 {growth_note} · YoY는 {prev} 대비 · 단위: 억원 · 출처: DART")
-xlsx_bytes, xlsx_name = build_excel(df)
+if feed is None:
+    st.caption("시가총액: 한국투자증권 API 키가 설정되지 않아 표시하지 않습니다.")
+else:
+    bucket = mcap_at.replace(minute=mcap_at.minute // 10 * 10, second=0, microsecond=0) if mcap_at else None
+    msg = (f"시가총액: **{mcap_at:%m/%d %H:%M}** 기준 · {len(mcap):,}/{len(names):,}개 종목 수신 · "
+           f"장중 약 3분마다 갱신 · 상태: {feed.status}") if mcap_at else f"시가총액: 받아오는 중... (상태: {feed.status})"
+    c_m, c_r = st.columns([5, 1])
+    c_m.caption(msg)
+    if c_r.button("🔄 새로고침"):
+        st.rerun()
+if feed is not None and mcap_at:
+    label = f"{bucket:%m/%d %H:%M}"
+    xlsx_bytes, xlsx_name = build_excel(df, frozen_mcap(label, feed), label)
+else:
+    xlsx_bytes, xlsx_name = build_excel(df)
 st.download_button("📥 전종목 엑셀 다운로드 (연간 5년 + 분기 20분기)", xlsx_bytes, file_name=xlsx_name,
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
@@ -326,8 +487,10 @@ c2.metric("영업이익 흑자", f"{(f['영업이익'] > 0).sum():,}개")
 c3.metric("흑자전환", f"{f['흑자전환'].sum():,}개")
 c4.metric("영업이익률 중앙값", f"{f['영업이익률(%)'].median():.1f}%" if len(f) else "-")
 
-show = f.reset_index()[["종목코드", "회사명", "시장", "공시통화", "매출기준", "매출액", "영업이익", "영업이익률(%)",
+show = f.reset_index()[["종목코드", "회사명", "시장", "시가총액", "공시통화", "매출기준", "매출액", "영업이익", "영업이익률(%)",
                          "매출 YoY(%)", "영업이익 YoY(%)", "매출 성장률(%)", "매출 추이", "영업이익 추이"]]
+if not has_mcap:
+    show = show.drop(columns=["시가총액"])
 if mode == "분기":  # 분기 기준에서는 매출 성장률이 곧 YoY라 중복 열 제거
     show = show.drop(columns=["매출 성장률(%)"])
 st.caption("행을 클릭하면 아래에 해당 기업의 상세 실적이 나옵니다.")
@@ -335,6 +498,7 @@ event = st.dataframe(
     show, hide_index=True, width="stretch", height=480,
     on_select="rerun", selection_mode="single-row",
     column_config={
+        "시가총액": st.column_config.NumberColumn("시가총액(억원)", format="localized"),
         "매출액": st.column_config.NumberColumn(f"매출액 ({cur})", format="localized"),
         "영업이익": st.column_config.NumberColumn(f"영업이익 ({cur})", format="localized"),
         "영업이익률(%)": st.column_config.NumberColumn(format="%.1f"),
