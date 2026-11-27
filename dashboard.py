@@ -227,6 +227,14 @@ grow_label = "매출 연평균 성장률 최소 (%, 4년)" if mode == "연간" e
 min_growth = st.sidebar.slider(grow_label, -50, 100, -50)
 only_profit = st.sidebar.checkbox("영업이익 흑자만")
 only_turn = st.sidebar.checkbox("흑자전환 기업만")
+yoy_word = "전년 대비" if mode == "연간" else "전년 동기 대비"
+st.sidebar.caption(f"YoY 성장 ({yoy_word} 금액 증가)")
+yoy_sales = st.sidebar.checkbox("매출액 YoY 성장")
+yoy_op = st.sidebar.checkbox("영업이익 YoY 성장 (적자 축소 포함)")
+if yoy_sales and yoy_op:
+    yoy_how = st.sidebar.radio("두 조건을", ["둘 다 성장", "하나라도 성장"], horizontal=True)
+else:
+    yoy_how = "둘 다 성장"
 min_streak = st.sidebar.slider("영업이익 연속 증가 (최소 횟수)", 0, 4 if mode == "연간" else 8, 0)
 
 # ---------------------------------------------------------------- 기간 정리
@@ -270,7 +278,10 @@ if mode == "연간":
         t["매출 성장률(%)"] = np.where((s0 > 0) & (s1 > 0), ((s1 / s0) ** (1 / 4) - 1) * 100, np.nan)
 else:
     t["매출 성장률(%)"] = growth(sales_w[cur], sales_w[prev])
-t["영업이익 증가율(%)"] = growth(op_w[cur], op_w[prev])
+t["매출 YoY(%)"] = growth(sales_w[cur], sales_w[prev])
+t["영업이익 YoY(%)"] = growth(op_w[cur], op_w[prev])
+t["매출증가"] = (sales_w[cur] > sales_w[prev]).fillna(False).astype(bool)
+t["영업이익증가"] = (op_w[cur] > op_w[prev]).fillna(False).astype(bool)
 t["흑자전환"] = ((op_w[cur] > 0) & (op_w[prev] <= 0)).fillna(False).astype(bool)
 t["연속증가"] = streak(op_w)
 t["매출 추이"] = trend(sales_w)
@@ -288,6 +299,13 @@ if min_growth > -50:
     f = f[f["매출 성장률(%)"] >= min_growth]
 if only_profit:
     f = f[f["영업이익"] > 0]
+if yoy_sales and yoy_op:
+    both = f["매출증가"] & f["영업이익증가"] if yoy_how == "둘 다 성장" else f["매출증가"] | f["영업이익증가"]
+    f = f[both]
+elif yoy_sales:
+    f = f[f["매출증가"]]
+elif yoy_op:
+    f = f[f["영업이익증가"]]
 if only_turn:
     f = f[f["흑자전환"].fillna(False).astype(bool)]
 if min_streak:
@@ -297,7 +315,7 @@ f = f.sort_values("매출액", ascending=False)
 # ---------------------------------------------------------------- 화면
 st.title("📊 국내 상장사 실적 스크리닝")
 growth_note = f"{base}→{cur} 연평균" if mode == "연간" else f"{prev} 대비"
-st.caption(f"기준 기간: **{cur}** · 매출 성장률은 {growth_note} · 영업이익 증가율은 {prev} 대비 · 단위: 억원 · 출처: DART")
+st.caption(f"기준 기간: **{cur}** · 매출 성장률은 {growth_note} · YoY는 {prev} 대비 · 단위: 억원 · 출처: DART")
 xlsx_bytes, xlsx_name = build_excel(df)
 st.download_button("📥 전종목 엑셀 다운로드 (연간 5년 + 분기 20분기)", xlsx_bytes, file_name=xlsx_name,
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
@@ -309,7 +327,9 @@ c3.metric("흑자전환", f"{f['흑자전환'].sum():,}개")
 c4.metric("영업이익률 중앙값", f"{f['영업이익률(%)'].median():.1f}%" if len(f) else "-")
 
 show = f.reset_index()[["종목코드", "회사명", "시장", "공시통화", "매출기준", "매출액", "영업이익", "영업이익률(%)",
-                         "매출 성장률(%)", "영업이익 증가율(%)", "매출 추이", "영업이익 추이"]]
+                         "매출 YoY(%)", "영업이익 YoY(%)", "매출 성장률(%)", "매출 추이", "영업이익 추이"]]
+if mode == "분기":  # 분기 기준에서는 매출 성장률이 곧 YoY라 중복 열 제거
+    show = show.drop(columns=["매출 성장률(%)"])
 st.caption("행을 클릭하면 아래에 해당 기업의 상세 실적이 나옵니다.")
 event = st.dataframe(
     show, hide_index=True, width="stretch", height=480,
@@ -318,8 +338,9 @@ event = st.dataframe(
         "매출액": st.column_config.NumberColumn(f"매출액 ({cur})", format="localized"),
         "영업이익": st.column_config.NumberColumn(f"영업이익 ({cur})", format="localized"),
         "영업이익률(%)": st.column_config.NumberColumn(format="%.1f"),
-        "매출 성장률(%)": st.column_config.NumberColumn(format="%.1f"),
-        "영업이익 증가율(%)": st.column_config.NumberColumn(format="%.1f"),
+        "매출 YoY(%)": st.column_config.NumberColumn(format="%.1f"),
+        "영업이익 YoY(%)": st.column_config.NumberColumn(format="%.1f"),
+        "매출 성장률(%)": st.column_config.NumberColumn("매출 연평균 성장률(%, 4년)", format="%.1f"),
         "매출 추이": st.column_config.LineChartColumn(f"매출 추이 ({periods[0]}~{cur})"),
         "영업이익 추이": st.column_config.LineChartColumn(f"영업이익 추이 ({periods[0]}~{cur})"),
     },
